@@ -620,28 +620,39 @@ impl Trang {
             ui.label("Chưa có Đợt gửi nào.");
             return;
         }
-        ui.horizontal_wrapped(|ui| {
-            let mut doi = None;
-            for d in &self.dot_ds {
-                let nhan = format!(
-                    "Đợt #{} · {} · {}",
-                    d.id,
-                    d.tao_luc.replace('T', " "),
-                    nhan_dot(d)
-                );
-                if ui
-                    .selectable_label(self.dot_chon == Some(d.id), nhan)
-                    .clicked()
-                {
-                    doi = Some(d.id);
-                }
+        const SO_DOT_HIEN: usize = 3;
+        let mut doi = None;
+        let mut chon_dot = |ui: &mut egui::Ui, d: &dot_gui::Dot, chon: Option<i64>| {
+            let nhan = format!(
+                "Đợt #{} · {} · {}",
+                d.id,
+                d.tao_luc.replace('T', " "),
+                nhan_dot(d)
+            );
+            if ui.selectable_label(chon == Some(d.id), nhan).clicked() {
+                doi = Some(d.id);
             }
-            if doi.is_some() {
-                self.dot_chon = doi;
-                self.tin_xem = None;
-                self.tai_lai_dot();
-            }
-        });
+        };
+        let (moi, cu) = self.dot_ds.split_at(SO_DOT_HIEN.min(self.dot_ds.len()));
+        for d in moi {
+            chon_dot(ui, d, self.dot_chon);
+        }
+        if !cu.is_empty() {
+            // Stay open while the selected Đợt is an old one, so the selection is never hidden.
+            let dang_chon_cu = cu.iter().any(|d| Some(d.id) == self.dot_chon);
+            egui::CollapsingHeader::new(format!("Các Đợt gửi cũ ({})", cu.len()))
+                .open(dang_chon_cu.then_some(true))
+                .show(ui, |ui| {
+                    for d in cu {
+                        chon_dot(ui, d, self.dot_chon);
+                    }
+                });
+        }
+        if doi.is_some() {
+            self.dot_chon = doi;
+            self.tin_xem = None;
+            self.tai_lai_dot();
+        }
         let Some(dot) = self
             .dot_ds
             .iter()
@@ -650,19 +661,29 @@ impl Trang {
         else {
             return;
         };
-        if let Some(loi) = &dot.loi {
-            ui.colored_label(egui::Color32::from_rgb(200, 50, 50), format!("Lỗi: {loi}"));
-        }
-        if let Some(loi) = self
+        let loi_tin = self
             .tin
             .iter()
             .find(|t| t.trang_thai == dot_gui::TIN_LOI)
-            .and_then(|t| t.loi.clone())
-        {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 50, 50),
-                format!("Đã dừng mọi Đợt gửi vì lỗi đầu tiên: {loi}. Tin lỗi sẽ không tự gửi lại."),
-            );
+            .and_then(|t| t.loi.clone());
+        if dot.loi.is_some() || loi_tin.is_some() {
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(254, 226, 226))
+                .show(ui, |ui| {
+                    let do_dam = egui::Color32::from_rgb(153, 27, 27);
+                    ui.label(RichText::new("Có lỗi, cần kiểm tra").strong().color(do_dam));
+                    if let Some(loi) = &dot.loi {
+                        ui.label(RichText::new(loi).color(do_dam));
+                    }
+                    if let Some(loi) = &loi_tin {
+                        ui.label(
+                            RichText::new(format!(
+                                "Tin lỗi: {loi}. Tin lỗi sẽ không tự gửi lại; kiểm tra nick Zalo rồi bấm Tiếp tục gửi."
+                            ))
+                            .color(do_dam),
+                        );
+                    }
+                });
         }
         let sua_duoc = dot.trang_thai != dot_gui::DOT_XONG;
         let (so_cho, so_chon) = (
@@ -720,7 +741,7 @@ impl Trang {
         let mut doi_chon: Option<(i64, bool)> = None;
         egui::ScrollArea::vertical()
             .id_salt("tin")
-            .max_height(320.0)
+            .max_height(480.0)
             .show_rows(ui, 24.0, self.tin.len(), |ui, range| {
                 for t in &self.tin[range] {
                     ui.horizontal(|ui| {
