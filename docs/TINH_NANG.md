@@ -73,7 +73,7 @@ Cột **Issue** trỏ tới nơi đang theo dõi. Nếu issue đã đóng, tính
 | Tính năng | Trạng thái | Ghi chú | Issue |
 |---|---|---|---|
 | Авто-Reply (Tự động trả lời theo từ khóa) | ✅ | Cấu hình trong **Cài đặt → Tiện ích (`autoreply_rules.json`)** | [#35](https://github.com/ctdoteam1110/ctdozlite/issues/35) |
-| Local HTTP REST API (`127.0.0.1`) | ✅ | Chạy với `--api-port <PORT>` hoặc `CTDOZLITE_API_PORT` (`/api/v1/status`, `/threads`, `/messages`, `/send`, `/schedule`, `/autoreply`) | [#35](https://github.com/ctdoteam1110/ctdozlite/issues/35) |
+| Local HTTP REST API (`127.0.0.1`) | ✅ | Chạy với `--api-port <PORT>` hoặc `CTDOZLITE_API_PORT` (`/api/v1/status`, `/threads`, `/messages`, `/send`, `/schedule`, `/autoreply`, `/friends`, `/users/lookup?phone=`) | [#35](https://github.com/ctdoteam1110/ctdozlite/issues/35) |
 | Model Context Protocol (MCP Server) | ✅ | Chạy `--mcp` (stdio JSON-RPC 2.0) hoặc gọi `POST /api/v1/mcp` để tích hợp Claude Desktop / Cursor / AI Agent | [#35](https://github.com/ctdoteam1110/ctdozlite/issues/35) |
 
 ---

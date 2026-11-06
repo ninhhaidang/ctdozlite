@@ -1236,6 +1236,15 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
         .await
         .map_err(|e| e.context("không tải được danh sách bạn bè"))?;
     let resp = s.maybe_decrypt(raw, s.session_key_bytes()).await;
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(crate::session::SessionError::new(code, msg).into());
+        }
+    }
     let data_root = resp.get("data").unwrap_or(&resp);
     let mut threads: Vec<Thread> = match data_root {
         Value::Array(items) => items.iter().filter_map(parse_thread).collect(),

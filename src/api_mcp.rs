@@ -278,6 +278,25 @@ pub async fn handle_mcp_request(
                             },
                             "required": ["action"]
                         }
+                    },
+                    {
+                        "name": "zalo_list_friends",
+                        "description": "Liệt kê danh sách bạn bè Zalo (ID và tên hiển thị) từ máy chủ",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "zalo_find_user_by_phone",
+                        "description": "Tra cứu tài khoản Zalo theo số điện thoại và tình trạng kết bạn",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "phone": { "type": "string", "description": "Số điện thoại (vd 0912345678 hoặc 84912345678)" }
+                            },
+                            "required": ["phone"]
+                        }
                     }
                 ]
             }
@@ -505,6 +524,32 @@ async fn execute_tool_call(
                 _ => (true, json!({ "error": format!("Unsupported action: {action}") })),
             }
         }
+        "zalo_list_friends" => {
+            let s = session.lock().await.clone();
+            let send2me_id = s.login.as_ref().map(|l| l.send2me_id.clone());
+            match chat::get_friends(&s).await {
+                Ok(threads) => {
+                    // get_friends also merges groups and the "Cloud của tôi" thread; keep people only.
+                    let items: Vec<Value> = threads
+                        .into_iter()
+                        .filter(|t| !t.is_group && Some(&t.id) != send2me_id.as_ref())
+                        .map(|t| json!({ "id": t.id, "name": t.name }))
+                        .collect();
+                    (false, json!({ "friends": items }))
+                }
+                Err(e) => (true, json!({ "error": format!("{e:#}") })),
+            }
+        }
+        "zalo_find_user_by_phone" => {
+            let Some(phone) = args.get("phone").and_then(Value::as_str) else {
+                return (true, json!({ "error": "Missing required argument: phone" }));
+            };
+            let s = session.lock().await.clone();
+            match chat::find_user_by_phone(&s, phone).await {
+                Ok(user) => (false, json!(user)),
+                Err(e) => (true, json!({ "error": format!("{e:#}") })),
+            }
+        }
         _ => (true, json!({ "error": format!("Unknown tool: {name}") })),
     }
 }
@@ -684,6 +729,28 @@ pub async fn handle_rest_request(
                 }),
             )
         }
+        ("GET", "/api/v1/friends") => {
+            let (err, val) =
+                execute_tool_call(session, "zalo_list_friends", &json!({}), db_path).await;
+            (if err { 502 } else { 200 }, val)
+        }
+        ("GET", "/api/v1/users/lookup") => {
+            let phone = query_params.get("phone").map(|p| p.trim()).unwrap_or("");
+            if phone.is_empty() {
+                return (
+                    400,
+                    json!({ "error": "Missing required query parameter: phone" }),
+                );
+            }
+            let (err, val) = execute_tool_call(
+                session,
+                "zalo_find_user_by_phone",
+                &json!({ "phone": phone }),
+                db_path,
+            )
+            .await;
+            (if err { 502 } else { 200 }, val)
+        }
         ("POST", "/api/v1/mcp") => match serde_json::from_str::<Value>(body) {
             Ok(req) => match handle_mcp_request(session, &req, db_path).await {
                 Some(resp) => (200, resp),
@@ -715,6 +782,8 @@ pub async fn handle_rest_request(
                     "GET /api/v1/autoreply",
                     "POST /api/v1/autoreply",
                     "GET /api/v1/export",
+                    "GET /api/v1/friends",
+                    "GET /api/v1/users/lookup?phone=<number>",
                     "POST /api/v1/mcp"
                 ]
             }),
@@ -790,6 +859,7 @@ pub async fn run_local_http_server(
                 202 => "202 Accepted",
                 400 => "400 Bad Request",
                 404 => "404 Not Found",
+                502 => "502 Bad Gateway",
                 _ => "500 Internal Server Error",
             };
             let body_str = serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".into());
@@ -943,5 +1013,47 @@ mod tests {
         assert_eq!(sched_val["ok"], true);
 
         let _ = std::fs::remove_file(&db_file);
+    }
+
+    #[tokio::test]
+    async fn rest_users_lookup_returns_400_when_phone_missing() {
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        for path in [
+            "/api/v1/users/lookup",
+            "/api/v1/users/lookup?phone=",
+            "/api/v1/users/lookup?phone=%20",
+        ] {
+            let (status, val) = handle_rest_request(&session, "GET", path, "", ":memory:").await;
+            assert_eq!(status, 400, "{path}");
+            assert!(val["error"].as_str().unwrap().contains("phone"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_friends_and_lookup_surface_errors_as_502_when_logged_out() {
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        for path in ["/api/v1/friends", "/api/v1/users/lookup?phone=0912345678"] {
+            let (status, val) = handle_rest_request(&session, "GET", path, "", ":memory:").await;
+            // Routed to the chat call (not 404) and its error is not swallowed.
+            assert_eq!(status, 502, "{path}");
+            assert_eq!(val["error"], "chưa đăng nhập");
+        }
+
+        let (status, val) =
+            handle_rest_request(&session, "GET", "/api/v1/nope", "", ":memory:").await;
+        assert_eq!(status, 404);
+        let endpoints = val["available_endpoints"].as_array().unwrap();
+        assert!(endpoints.iter().any(|e| e == "GET /api/v1/friends"));
+
+        let tools_resp = handle_mcp_request(
+            &session,
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            ":memory:",
+        )
+        .await
+        .unwrap();
+        let tools = tools_resp["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "zalo_list_friends"));
+        assert!(tools.iter().any(|t| t["name"] == "zalo_find_user_by_phone"));
     }
 }
