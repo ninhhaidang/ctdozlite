@@ -566,6 +566,8 @@ pub struct ZaloGuiApp {
     checking_friend_status: HashSet<String>,
     user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
+    cskh_open: bool,
+    cskh: crate::cskh::giao_dien::Trang,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     notification_authorization: crate::native_notifications::AuthorizationState,
@@ -807,6 +809,8 @@ impl ZaloGuiApp {
             checking_friend_status: HashSet::new(),
             user_online_map: HashMap::new(),
             allow_quit: false,
+            cskh_open: false,
+            cskh: Default::default(),
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
@@ -1827,9 +1831,13 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
-            || ctx.input(|i| i.viewport().close_requested())
-        {
+        let quit_requested = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
+            || ctx.input(|i| i.viewport().close_requested());
+        if quit_requested && crate::cskh::bo_gui::dang_chay() {
+            // The customer-care sender is running: confirm before closing (closing pauses it).
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.cskh.hoi_thoat = true;
+        } else if quit_requested || self.cskh.ve_hoi_thoat(ctx) {
             self.allow_quit = true;
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);
@@ -2222,7 +2230,11 @@ impl ZaloGuiApp {
                             Stroke::new(1.4_f32, close_fg),
                         );
                         let close_resp = close_resp.on_hover_text("Đóng ứng dụng (Ctrl+Q)");
-                        if close_resp.clicked() || close_resp.secondary_clicked() {
+                        if (close_resp.clicked() || close_resp.secondary_clicked())
+                            && crate::cskh::bo_gui::dang_chay()
+                        {
+                            self.cskh.hoi_thoat = true;
+                        } else if close_resp.clicked() || close_resp.secondary_clicked() {
                             self.allow_quit = true;
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::EndCall);
