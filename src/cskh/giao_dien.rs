@@ -64,7 +64,7 @@ pub struct Trang {
 
 fn nhan_dot(d: &Dot) -> &'static str {
     match d.trang_thai.as_str() {
-        dot_gui::DOT_NHAP => "Nháp, chưa gửi",
+        dot_gui::DOT_NHAP => "Chưa gửi / đã dừng",
         dot_gui::DOT_DANG_GUI => "Đang gửi",
         dot_gui::DOT_DUNG_VI_LOI => "Đã dừng vì lỗi",
         dot_gui::DOT_XONG => "Đã xong",
@@ -677,15 +677,15 @@ impl Trang {
         );
         ui.horizontal(|ui| {
             let nut = match dot.trang_thai.as_str() {
-                dot_gui::DOT_NHAP => Some("Gửi đợt này"),
+                dot_gui::DOT_NHAP => Some("Gửi đợt này (hoặc gửi tiếp)"),
                 dot_gui::DOT_DUNG_VI_LOI => Some("Tiếp tục gửi (bỏ qua tin lỗi)"),
                 _ => None,
             };
             if let Some(nut) = nut {
-                if ui
-                    .add_enabled(so_chon > 0, egui::Button::new(RichText::new(nut).strong()))
-                    .clicked()
-                {
+                let gui =
+                    egui::Button::new(RichText::new(nut).strong().color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(5, 150, 105));
+                if ui.add_enabled(so_chon > 0, gui).clicked() {
                     let id = dot.id;
                     if self.lam(|c| dot_gui::bat_dau(c, id)).is_some() {
                         bo_gui::khoi_dong(&self.uin);
@@ -693,12 +693,29 @@ impl Trang {
                     }
                 }
             }
-            ui.label(format!(
-                "{so_chon} tin được chọn gửi / {so_cho} tin chưa gửi."
-            ));
             if dot.trang_thai == dot_gui::DOT_DANG_GUI {
-                ui.label("Đang gửi theo nhịp; đóng ứng dụng là tạm dừng, mở lại sẽ gửi tiếp.");
+                let dung = egui::Button::new(
+                    RichText::new("Dừng gửi")
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::from_rgb(220, 38, 38));
+                if ui.add(dung).clicked() {
+                    let id = dot.id;
+                    if self.lam(|c| dot_gui::dung_gui(c, id)).is_some() {
+                        self.tai_lai_dot();
+                    }
+                }
             }
+            let so_da_gui = self
+                .tin
+                .iter()
+                .filter(|t| t.trang_thai == dot_gui::TIN_DA_GUI)
+                .count();
+            ui.label(format!(
+                "Đã gửi {so_da_gui}/{} · {so_chon} tin được chọn gửi tiếp / {so_cho} tin chưa gửi.",
+                self.tin.len()
+            ));
         });
         let mut doi_chon: Option<(i64, bool)> = None;
         egui::ScrollArea::vertical()

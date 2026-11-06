@@ -240,6 +240,17 @@ pub fn bat_dau(conn: &Connection, dot_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The seller pressed "Dừng gửi": back to `nhap`, so ticks are editable again and "Gửi đợt này"
+/// resumes it. `gui_tiep` re-checks the state before every message, so nothing more is sent
+/// (a message already handed to Zalo cannot be recalled). Not resumed on app start: only `dang_gui` is.
+pub fn dung_gui(conn: &Connection, dot_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE dot_gui SET trang_thai = ? WHERE id = ? AND trang_thai = ?",
+        params![DOT_NHAP, dot_id, DOT_DANG_GUI],
+    )?;
+    Ok(())
+}
+
 /// Send the remaining messages of one Đợt gửi. Must only run on the single sender thread
 /// (`bo_gui`), so the cap, spacing and slot reservation are never checked concurrently.
 pub fn gui_tiep<R: Rng + ?Sized>(
@@ -571,6 +582,21 @@ mod tests {
         let tin = tin_cua_dot(&conn, dot).unwrap();
         assert_eq!(tin[1].trang_thai, TIN_CHO, "unticked message stays unsent");
         assert_eq!(super::dot(&conn, dot).unwrap().trang_thai, DOT_XONG);
+    }
+
+    #[test]
+    fn stopping_sends_nothing_more_and_can_resume() {
+        let conn = db::mo_bo_nho().unwrap();
+        let dh = DongHoGia::luc("2026-03-01 09:00:00");
+        let dot = dot_san(&conn, 3, dh.now());
+        let z = zalo(&dh, &conn, None);
+        dung_gui(&conn, dot).unwrap();
+        assert_eq!(super::dot(&conn, dot).unwrap().trang_thai, DOT_NHAP);
+        assert_eq!(chay(&conn, dot, &dh, &z), LyDoDung::KhongChay);
+        assert!(z.da_gui.borrow().is_empty());
+        bat_dau(&conn, dot).unwrap();
+        assert_eq!(chay(&conn, dot, &dh, &z), LyDoDung::Xong);
+        assert_eq!(z.da_gui.borrow().len(), 3);
     }
 
     #[test]
