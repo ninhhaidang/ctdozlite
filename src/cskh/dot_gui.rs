@@ -332,8 +332,12 @@ pub fn gui_tiep<R: Rng + ?Sized>(
             )?;
             // The first error stops every running Đợt: an odd error may mean the account is about to be limited.
             tx.execute(
-                "UPDATE dot_gui SET trang_thai = ? WHERE trang_thai = ?",
-                params![DOT_DUNG_VI_LOI, DOT_DANG_GUI],
+                "UPDATE dot_gui SET trang_thai = ?, loi = ? WHERE trang_thai = ?",
+                params![
+                    DOT_DUNG_VI_LOI,
+                    format!("Lỗi khi gửi tin, đã dừng mọi Đợt gửi: {loi}"),
+                    DOT_DANG_GUI
+                ],
             )?;
             tx.commit()?;
             return Ok(LyDoDung::Loi);
@@ -671,6 +675,11 @@ mod tests {
             vec![TIN_DA_GUI, TIN_LOI, TIN_CHO]
         );
         assert_eq!(tin[1].loi.as_deref(), Some("Zalo từ chối"));
+        assert!(super::dot(&conn, dot2)
+            .unwrap()
+            .loi
+            .unwrap()
+            .contains("Zalo từ chối"));
         assert_eq!(super::dot(&conn, dot1).unwrap().trang_thai, DOT_DUNG_VI_LOI);
         assert_eq!(
             super::dot(&conn, dot2).unwrap().trang_thai,

@@ -224,7 +224,13 @@ impl Trang {
             self.mo(uin);
         }
         if let Some(rx) = &self.nhap_rx {
-            if let Ok(tom_tat) = rx.try_recv() {
+            use std::sync::mpsc::TryRecvError::{Disconnected, Empty};
+            let xong = match rx.try_recv() {
+                Ok(tom_tat) => Some(tom_tat),
+                Err(Disconnected) => Some("Việc nhập Excel bị gián đoạn, hãy thử lại.".to_string()),
+                Err(Empty) => None,
+            };
+            if let Some(tom_tat) = xong {
                 self.thong_bao = tom_tat;
                 self.nhap_rx = None;
                 self.tai_lai();

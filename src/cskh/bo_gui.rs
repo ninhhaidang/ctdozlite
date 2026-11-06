@@ -99,8 +99,9 @@ pub fn khoi_dong(uin: &str) {
                     let _ =
                         dot_gui::dung_het_vi_loi(&conn, &format!("Lỗi nội bộ, đã dừng gửi: {e}"));
                 }
+                // The normal exit clears the flag itself (under the lock, see `chay_den_het`).
+                *DANG_CHAY.lock().unwrap_or_else(|e| e.into_inner()) = false;
             }
-            *DANG_CHAY.lock().unwrap_or_else(|e| e.into_inner()) = false;
         });
     if spawn.is_err() {
         *chay = false;
@@ -117,7 +118,16 @@ fn chay_den_het(db_path: &std::path::Path, phien: PhienChung, uin: String) -> an
         uin,
     };
     let mut rng = rand::thread_rng();
-    while dot_gui::co_dot_dang_gui(&conn)? {
+    loop {
+        if !dot_gui::co_dot_dang_gui(&conn)? {
+            // Re-check under the lock `khoi_dong` takes, so a Đợt started just now is never left
+            // without a sender.
+            let mut chay = DANG_CHAY.lock().unwrap_or_else(|e| e.into_inner());
+            if !dot_gui::co_dot_dang_gui(&conn)? {
+                *chay = false;
+                return Ok(());
+            }
+        }
         let ids: Vec<i64> = dot_gui::danh_sach_dot(&conn)?
             .into_iter()
             .rev()
@@ -135,5 +145,4 @@ fn chay_den_het(db_path: &std::path::Path, phien: PhienChung, uin: String) -> an
             DongHoThat.ngu(CHO_KIEM_TRA_LAI_GIAY);
         }
     }
-    Ok(())
 }
