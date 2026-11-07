@@ -84,6 +84,9 @@ pub enum GuiEvent {
         key: String,
         image: egui::ColorImage,
     },
+    StickerImageFailed {
+        key: String,
+    },
     StickerStoreLoaded(Vec<crate::chat::StickerPackInfo>),
     StickerPackItemsLoaded {
         cate_id: u64,
@@ -100,6 +103,10 @@ pub enum GuiEvent {
         items: Vec<crate::chat::StickerItem>,
     },
     LinkPreviewReady(crate::chat::LinkMetadata),
+    GroupMembersLoaded {
+        group_id: String,
+        members: Vec<crate::chat::SidebarMember>,
+    },
     PhoneLookupSuccess(crate::chat::PhoneLookupResult),
     PhoneLookupFailed(String),
     FriendStatusChecked {
@@ -120,6 +127,7 @@ pub enum GuiEvent {
         ts: i64,
         reaction: String,
     },
+    ReactionEventsReceived(Vec<crate::reactions::ReactionEvent>),
     MessageDeleted {
         thread_id: String,
         msg_id: String,
@@ -130,6 +138,18 @@ pub enum GuiEvent {
         msg_id: String,
         ts: i64,
     },
+    ForwardFinished {
+        target_name: String,
+        error: Option<String>,
+    },
+    ScreenshotCaptured {
+        path: std::path::PathBuf,
+        width: u32,
+        height: u32,
+        image: egui::ColorImage,
+    },
+    TypingEventsReceived(Vec<crate::chat::TypingEvent>),
+    SeenEventsReceived(Vec<crate::chat::SeenEvent>),
     SendFailed {
         thread_id: String,
         text: String,
@@ -190,6 +210,7 @@ pub enum GuiEvent {
         >,
     ),
     MuteSnapshotSynced(HashMap<String, i64>),
+    PinnedSnapshotSynced(Vec<String>),
     MuteEventsReceived(Vec<crate::chat::MuteControlEvent>),
     PhoneSyncProgress {
         progress: f32,
@@ -471,6 +492,10 @@ pub struct GuiTx {
 }
 
 impl GuiTx {
+    pub fn new(tx: Sender<GuiEvent>, ctx: egui::Context) -> Self {
+        Self { tx, ctx }
+    }
+
     /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
@@ -515,6 +540,9 @@ pub struct ZaloGuiApp {
     forward_msg: Option<ChatMessage>,
     forward_filter: String,
     filter_starred_only: bool,
+    pub(crate) send_hd_original: bool,
+    pub(crate) typing_map: HashMap<String, (String, std::time::Instant)>,
+    pub(crate) last_typing_ping_at: std::time::Instant,
     active_call: Option<ActiveCallOverlay>,
     image_viewer: Option<ImageViewerModal>,
 
@@ -556,6 +584,8 @@ pub struct ZaloGuiApp {
     last_composer_text: String,
     last_composer_edit_at: std::time::Instant,
     composer_sticker_selected: Option<usize>,
+    composer_mention_selected: usize,
+    dismissed_mention_suggest_for: String,
     composer_focus_pending: bool,
     pending_clipboard_image: Option<(std::path::PathBuf, u32, u32, TextureHandle)>,
     unread_counts: HashMap<String, usize>,
@@ -564,6 +594,9 @@ pub struct ZaloGuiApp {
     dismissed_link_preview_for: String,
     friend_status_map: HashMap<String, crate::chat::FriendshipStatus>,
     checking_friend_status: HashSet<String>,
+    group_members_map: HashMap<String, Vec<crate::chat::SidebarMember>>,
+    fetching_group_members: HashSet<String>,
+    group_member_search: String,
     user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
     cskh_open: bool,
@@ -754,6 +787,9 @@ impl ZaloGuiApp {
             forward_msg: None,
             forward_filter: String::new(),
             filter_starred_only: false,
+            send_hd_original: true,
+            typing_map: HashMap::new(),
+            last_typing_ping_at: std::time::Instant::now(),
             active_call: None,
             image_viewer: None,
             status_msg: "Trực tuyến · Sẵn sàng".into(),
@@ -799,6 +835,8 @@ impl ZaloGuiApp {
             last_composer_text: String::new(),
             last_composer_edit_at: std::time::Instant::now(),
             composer_sticker_selected: None,
+            composer_mention_selected: 0,
+            dismissed_mention_suggest_for: String::new(),
             composer_focus_pending: false,
             pending_clipboard_image: None,
             unread_counts: HashMap::new(),
@@ -807,6 +845,9 @@ impl ZaloGuiApp {
             dismissed_link_preview_for: String::new(),
             friend_status_map: HashMap::new(),
             checking_friend_status: HashSet::new(),
+            group_members_map: HashMap::new(),
+            fetching_group_members: HashSet::new(),
+            group_member_search: String::new(),
             user_online_map: HashMap::new(),
             allow_quit: false,
             cskh_open: false,
@@ -1274,11 +1315,47 @@ impl ZaloGuiApp {
                         if let Some(m) = t.messages.iter_mut().find(|m| {
                             (!m.id.is_empty() && m.id == msg_id) || (m.id.is_empty() && m.ts == ts)
                         }) {
-                            m.reactions = vec![reaction];
+                            if m.reaction_summaries.is_empty() && !m.reactions.is_empty() {
+                                m.reaction_summaries = m.reactions.iter().map(|e| crate::reactions::ReactionSummary {
+                                    emoji: e.clone(),
+                                    count: 1,
+                                    ..Default::default()
+                                }).collect();
+                            }
+                            if let Some(pos) = m.reaction_summaries.iter().position(|s| s.emoji == reaction) {
+                                m.reaction_summaries[pos].count += 1;
+                            } else {
+                                m.reaction_summaries.push(crate::reactions::ReactionSummary {
+                                    emoji: reaction.clone(),
+                                    count: 1,
+                                    ..Default::default()
+                                });
+                            }
+                            m.reactions = m.reaction_summaries.iter().map(|s| s.emoji.clone()).collect();
                         }
                         self.persist_threads_async();
                     }
                     self.status_msg = "Đã thả cảm xúc".into();
+                }
+                GuiEvent::ReactionEventsReceived(events) => {
+                    let mut any_changed = false;
+                    for ev in events {
+                        for t in self.threads.iter_mut() {
+                            for m in t.messages.iter_mut() {
+                                if (!ev.message_id.is_empty() && m.id == ev.message_id)
+                                    || (!ev.client_message_id.is_empty() && m.client_message_id == ev.client_message_id)
+                                    || (ev.ts > 0 && m.ts == ev.ts)
+                                {
+                                    if m.apply_reaction(&ev) {
+                                        any_changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if any_changed {
+                        self.persist_threads_async();
+                    }
                 }
                 GuiEvent::MessageDeleted {
                     thread_id,
@@ -1307,22 +1384,98 @@ impl ZaloGuiApp {
                             (!msg_id.is_empty() && m.id == msg_id)
                                 || (msg_id.is_empty() && m.ts == ts)
                         }) {
-                            m.text = "[Tin nhắn đã thu hồi]".into();
-                            m.sticker_id = None;
-                            m.link_url = None;
-                            m.link_thumb = None;
+                            if !m.text.starts_with("[Đã thu hồi]") {
+                                if m.text.trim().is_empty() {
+                                    m.text = "[Tin nhắn đã thu hồi]".into();
+                                } else {
+                                    m.text = format!("[Đã thu hồi] {}", m.text);
+                                }
+                            }
+                            // Anti-recall: Preserve sticker_id, link_url, link_thumb so user can still see media!
                         }
                         if let Some(last) = t.messages.last() {
                             t.preview = last.text.clone();
                         }
                         self.persist_threads_async();
                     }
-                    self.status_msg = "Đã thu hồi tin nhắn với mọi người".into();
+                    self.status_msg = "Có tin nhắn vừa bị thu hồi (đã lưu lại)".into();
+                }
+                GuiEvent::ForwardFinished { target_name, error } => {
+                    match error {
+                        None => {
+                            self.show_toast(format!("Đã chuyển tiếp tới {target_name}"));
+                            self.status_msg = format!("Đã chuyển tiếp tới {target_name}");
+                        }
+                        Some(err) => {
+                            self.show_toast(format!("Chuyển tiếp tới {target_name} thất bại: {err}"));
+                            self.status_msg = format!("Chuyển tiếp thất bại: {err}");
+                        }
+                    }
+                }
+                GuiEvent::ScreenshotCaptured { path, width, height, image } => {
+                    let tex = ctx.load_texture(
+                        format!("clip_preview_{}", crate::login::unix_now()),
+                        image,
+                        TextureOptions::LINEAR,
+                    );
+                    self.pending_clipboard_image = Some((path, width, height, tex));
+                    self.composer_focus_pending = true;
+                    self.show_toast(format!(
+                        "Đã chụp ảnh màn hình ({width}×{height} px) — nhấn Enter để gửi"
+                    ));
+                    self.status_msg = format!("Đã chụp ảnh màn hình ({width}×{height} px)");
+                }
+                GuiEvent::TypingEventsReceived(evs) => {
+                    for ev in evs {
+                        if ev.is_typing {
+                            let name = if let Some(t) = self.threads.iter().find(|t| t.id == ev.thread_id) {
+                                if t.is_group {
+                                    self.group_members_map
+                                        .get(&t.id)
+                                        .and_then(|members| members.iter().find(|m| m.id == ev.uid))
+                                        .map(|m| m.name.clone())
+                                        .unwrap_or_else(|| {
+                                            if ev.uid.is_empty() {
+                                                "Thành viên".to_string()
+                                            } else {
+                                                format!("Người dùng {}", ev.uid)
+                                            }
+                                        })
+                                } else {
+                                    t.name.clone()
+                                }
+                            } else {
+                                "Đối phương".to_string()
+                            };
+                            self.typing_map.insert(
+                                ev.thread_id,
+                                (name, std::time::Instant::now() + std::time::Duration::from_secs(6)),
+                            );
+                        } else {
+                            self.typing_map.remove(&ev.thread_id);
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                GuiEvent::SeenEventsReceived(evs) => {
+                    for ev in evs {
+                        if let Some(t) = self.threads.iter_mut().find(|t| t.id == ev.thread_id) {
+                            for m in t.messages.iter_mut().filter(|m| m.is_outgoing) {
+                                if ev.seen_ts == 0 || m.ts <= ev.seen_ts * 1000 + 5000 {
+                                    m.delivery = crate::message_model::DeliveryState::Read;
+                                }
+                            }
+                        }
+                    }
+                    ctx.request_repaint();
                 }
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
                     let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
                     self.sticker_textures.insert(key, tex);
+                }
+                GuiEvent::StickerImageFailed { key } => {
+                    self.loading_stickers.remove(&key);
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {
                     self.sticker_store_loading = false;
@@ -1427,6 +1580,33 @@ impl ZaloGuiApp {
                     if updated_any {
                         self.persist_threads_async();
                     }
+                }
+                GuiEvent::GroupMembersLoaded { group_id, members } => {
+                    self.fetching_group_members.remove(&group_id);
+                    for m in &members {
+                        if let Some(ref ava_url) = m.avatar {
+                            if ava_url.starts_with("http") {
+                                let file_or_base = crate::chat::avatar_file_key(Some(ava_url.as_str()))
+                                    .unwrap_or_else(|| ava_url.split('?').next().unwrap_or(ava_url).to_string());
+                                let key = format!("ava_{}", crate::crypto::md5_hex(&file_or_base));
+                                if !self.sticker_textures.contains_key(&key)
+                                    && self.loading_stickers.insert(key.clone())
+                                {
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                            key,
+                                            url: ava_url.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(t) = self.threads.iter_mut().find(|th| th.id == group_id) {
+                        t.presentation.members = members.clone();
+                        t.presentation.member_count = Some(members.len() as u64);
+                    }
+                    self.group_members_map.insert(group_id, members);
                 }
                 GuiEvent::FriendStatusChecked {
                     user_id,
@@ -1723,6 +1903,24 @@ impl ZaloGuiApp {
                     }
                     self.persist_threads_async();
                 }
+                GuiEvent::PinnedSnapshotSynced(pinned_ids) => {
+                    for pid in &pinned_ids {
+                        let clean = pid
+                            .trim_start_matches("group_")
+                            .trim_start_matches('g')
+                            .trim_start_matches('G')
+                            .trim_start_matches('u')
+                            .trim_start_matches('U')
+                            .trim()
+                            .to_string();
+                        if !clean.is_empty() && !self.settings.pinned_threads.contains(&clean) {
+                            self.settings.pinned_threads.push(clean);
+                        }
+                    }
+                    crate::chat::apply_pinned_threads(&mut self.threads, &pinned_ids);
+                    self.settings.save();
+                    self.persist_threads_async();
+                }
                 GuiEvent::MuteEventsReceived(events) => {
                     let mut changed = false;
                     for ev in events {
@@ -1763,13 +1961,33 @@ impl ZaloGuiApp {
                     self.phone_sync_progress = 0.0;
                     if !threads.is_empty() {
                         for nt in threads {
+                            let is_pinned = nt.presentation.pinned
+                                || self.settings.pinned_threads.contains(&nt.id)
+                                || crate::chat::is_pinned_in_list(&nt.id, nt.is_group, &self.settings.pinned_threads);
+                            if is_pinned {
+                                let clean = nt.id
+                                    .trim_start_matches("group_")
+                                    .trim_start_matches('g')
+                                    .trim_start_matches('G')
+                                    .trim_start_matches('u')
+                                    .trim_start_matches('U')
+                                    .trim()
+                                    .to_string();
+                                if !clean.is_empty() && !self.settings.pinned_threads.contains(&clean) {
+                                    self.settings.pinned_threads.push(clean);
+                                }
+                            }
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
                                 crate::chat::merge_thread_into(existing, nt, true);
+                                if is_pinned {
+                                    existing.presentation.pinned = true;
+                                }
                             } else if !nt.id.is_empty() && nt.id != "0" {
                                 self.threads.push(nt);
                             }
                         }
+                        self.settings.save();
                         self.persist_threads_async();
                     }
                     let msg = phone_sync_completion_message(

@@ -1772,7 +1772,7 @@ impl ZaloGuiApp {
                                                         ui.add_space(4.0);
                                                         ui.label(
                                                             RichText::new(
-                                                                "Mẹo: Hãy giữ ứng dụng Zalo trên điện thoại mở và kết nối mạng trong lúc đồng bộ (xác nhận trên điện thoại nếu Zalo hỏi).",
+                                                                "Lưu ý: Kéo tin nhắn 1-1 trực tiếp từ điện thoại qua mạng phụ thuộc giao thức xác thực thiết bị Zalo. Với tin nhắn nhóm và Cloud của tôi, bạn có thể bấm 'Đồng bộ Nhóm & Cloud ngay' bên dưới; hoặc dùng mục 'Nhập lịch sử' từ file sao lưu Zalo.",
                                                             )
                                                             .color(pal.text_secondary)
                                                             .size(12.2),
@@ -2973,6 +2973,7 @@ impl ZaloGuiApp {
                 });
             }
             self.show_toast("📲 Đang yêu cầu đồng bộ tin nhắn từ điện thoại…");
+            ctx.request_repaint();
         }
         if apply_proxy_now {
             let proxy_url = self.settings.proxy_url.trim().to_string();
@@ -5455,7 +5456,7 @@ impl ZaloGuiApp {
             .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
             .collect();
         let mut open = true;
-        let mut chosen: Option<(String, bool)> = None;
+        let mut chosen: Option<(String, bool, String)> = None;
         egui::Window::new("Chuyển tiếp tin nhắn")
             .open(&mut open)
             .collapsible(false)
@@ -5491,19 +5492,22 @@ impl ZaloGuiApp {
                                 .on_hover_cursor(CursorIcon::PointingHand)
                                 .clicked()
                             {
-                                chosen = Some((id.clone(), *is_group));
+                                chosen = Some((id.clone(), *is_group, name.clone()));
                             }
                         }
                     });
             });
-        if let Some((target_id, target_is_group)) = chosen {
+        if let Some((target_id, target_is_group, target_name)) = chosen {
             if let (Some(msg), Some(tx)) = (self.forward_msg.take(), WORKER_TX.get()) {
                 let _ = tx.send(WorkerCmd::Forward {
                     target_id,
                     target_is_group,
                     msg,
+                    target_name: target_name.clone(),
                 });
-                self.status_msg = "Đang chuyển tiếp…".into();
+                self.show_toast(format!("Đang chuyển tiếp tới {target_name}…"));
+                self.status_msg = format!("Đang chuyển tiếp tới {target_name}…");
+                ctx.request_repaint();
             }
         } else if !open {
             self.forward_msg = None;

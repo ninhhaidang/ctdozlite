@@ -79,19 +79,37 @@ fn helper_path() -> PathBuf {
             .join("native/macos/build/DailyNotifier.app/Contents/MacOS/DailyNotifier")
     })
 }
+/// Spawn the helper, retrying briefly on `ETXTBSY`: a write handle to a freshly written executable
+/// can still be held by a concurrently forked child that has not reached `exec` yet.
+async fn spawn_helper(
+    path: &Path,
+    command: &str,
+) -> Result<tokio::process::Child, NotificationError> {
+    let mut attempt = 0;
+    loop {
+        match tokio::process::Command::new(path)
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(10 * attempt)).await;
+            }
+            Err(_) => return Err(NotificationError::HelperUnavailable),
+        }
+    }
+}
 async fn invoke(
     path: &Path,
     command: &str,
     deadline: Duration,
 ) -> Result<AuthorizationStatus, NotificationError> {
-    let mut child = tokio::process::Command::new(path)
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| NotificationError::HelperUnavailable)?;
+    let mut child = spawn_helper(path, command).await?;
     let operation = async {
         let mut output = Vec::new();
         child

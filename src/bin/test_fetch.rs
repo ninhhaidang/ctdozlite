@@ -146,6 +146,22 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    } else if let Some(pos) = args.iter().position(|a| a == "--send-file") {
+        if let (Some(to_id), Some(file_path)) = (args.get(pos + 1), args.get(pos + 2)) {
+            println!("\n--- [6] Thử gửi tập tin tới {to_id}: '{file_path}' ---");
+            let p = std::path::PathBuf::from(file_path);
+            match zalo_rust::chat::send_attachment(&s, to_id, false, &p, "").await {
+                Ok((resp, cm)) => {
+                    println!("✓ Gửi file THÀNH CÔNG!");
+                    println!("  msgId: {}, text: {}", cm.id, cm.text);
+                    println!("  link_url: {:?}", cm.link_url);
+                    println!("  Response: {}", serde_json::to_string_pretty(&resp)?);
+                }
+                Err(e) => {
+                    println!("! Gửi file lỗi: {e}");
+                }
+            }
+        }
     }
 
     Ok(())

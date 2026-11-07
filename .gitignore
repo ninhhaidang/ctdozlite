@@ -89,3 +89,6 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Sync v2 private keys (NEVER COMMIT)
+sync_v2_keys.json

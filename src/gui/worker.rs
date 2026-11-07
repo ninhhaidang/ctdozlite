@@ -50,6 +50,7 @@ pub enum WorkerCmd {
         target_id: String,
         target_is_group: bool,
         msg: ChatMessage,
+        target_name: String,
     },
     React {
         to_id: String,
@@ -80,6 +81,12 @@ pub enum WorkerCmd {
         images_only: bool,
         caption: String,
         preset_path: Option<std::path::PathBuf>,
+        original_hd: bool,
+    },
+    TriggerScreenshot,
+    SendTyping {
+        thread_id: String,
+        is_group: bool,
     },
     FetchStickerImage {
         key: String,
@@ -180,6 +187,9 @@ pub enum WorkerCmd {
     FetchSocialProfile {
         target_uid: String,
     },
+    FetchGroupMembers {
+        group_id: String,
+    },
     FetchMySocialAvatars {
         page: u32,
         count: u32,
@@ -199,10 +209,6 @@ pub enum WorkerCmd {
         url: String,
         file_name: String,
         download_dir: String,
-    },
-    SendTyping {
-        thread_id: String,
-        is_group: bool,
     },
     SendSeen {
         thread_id: String,
@@ -528,6 +534,24 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     .send(GuiEvent::MuteEventsReceived(mute_evs));
                                                 ctx_ws.request_repaint();
                                             }
+                                            let (typing_evs, seen_evs) =
+                                                crate::chat::extract_typing_and_seen_controls(data_node);
+                                            if !typing_evs.is_empty() {
+                                                let _ = gui_tx_ws.send(GuiEvent::TypingEventsReceived(typing_evs));
+                                                ctx_ws.request_repaint();
+                                            }
+                                            if !seen_evs.is_empty() {
+                                                let _ = gui_tx_ws.send(GuiEvent::SeenEventsReceived(seen_evs));
+                                                ctx_ws.request_repaint();
+                                            }
+                                            let react_evs =
+                                                crate::reactions::parse_reaction_events(data_node);
+                                            if !react_evs.is_empty() {
+                                                let _ = gui_tx_ws
+                                                    .send(GuiEvent::ReactionEventsReceived(react_evs));
+                                                ctx_ws.request_repaint();
+                                            }
+
                                             for sync_ev in
                                                 crate::chat::extract_mobile_sync_controls(data_node)
                                             {
@@ -711,13 +735,23 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     let mut st = cps.lock().await;
                                     crate::call::poll_control_events(&s_snap, &mut st).await
                                 };
-                                if let Ok((events, mute_evs)) = ctrl_res {
+                                if let Ok((events, mute_evs, typing_evs, seen_evs)) = ctrl_res {
                                     for ev in events {
                                         cb.handle_control_event(ev);
                                     }
                                     if !mute_evs.is_empty() {
                                         let _ = gui_tx_ctrl
                                             .send(GuiEvent::MuteEventsReceived(mute_evs));
+                                        ctx_ctrl.request_repaint();
+                                    }
+                                    if !typing_evs.is_empty() {
+                                        let _ = gui_tx_ctrl
+                                            .send(GuiEvent::TypingEventsReceived(typing_evs));
+                                        ctx_ctrl.request_repaint();
+                                    }
+                                    if !seen_evs.is_empty() {
+                                        let _ = gui_tx_ctrl
+                                            .send(GuiEvent::SeenEventsReceived(seen_evs));
                                         ctx_ctrl.request_repaint();
                                     }
                                 } else {
@@ -1108,6 +1142,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                     ) {
                                                                         ex.avatar = gt.avatar;
                                                                     }
+                                                                    ex.presentation.posting_restricted = gt.presentation.posting_restricted;
                                                                     ex.is_group = true;
                                                                 } else {
                                                                     list.push(gt);
@@ -1146,6 +1181,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                     ),
                                                                 );
                                                             }
+                                                        }
+                                                        if let Ok(pinned_resp) = crate::chat::get_pinned(&s).await {
+                                                            let pids = crate::chat::parse_pinned_conversations(&pinned_resp);
+                                                            crate::chat::apply_pinned_threads(&mut list, &pids);
+                                                            let _ = gui_tx_clone.send(GuiEvent::PinnedSnapshotSynced(pids));
                                                         }
                                                         let sync_snapshot = list.clone();
                                                         let _ = gui_tx_clone
@@ -1300,6 +1340,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     ) {
                                                         ex.avatar = gt.avatar;
                                                     }
+                                                    ex.presentation.posting_restricted = gt.presentation.posting_restricted;
                                                     ex.is_group = true;
                                                 } else {
                                                     list.push(gt);
@@ -1345,6 +1386,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             let _ = gui_tx_clone
                                                 .send(GuiEvent::MuteSnapshotSynced(mute_map));
                                         }
+                                    }
+                                    if let Ok(pinned_resp) = crate::chat::get_pinned(&s).await {
+                                        let pids = crate::chat::parse_pinned_conversations(&pinned_resp);
+                                        crate::chat::apply_pinned_threads(&mut list, &pids);
+                                        let _ = gui_tx_clone.send(GuiEvent::PinnedSnapshotSynced(pids));
                                     }
                                     let total_msgs: usize =
                                         list.iter().map(|t| t.messages.len()).sum();
@@ -2007,6 +2053,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             target_id,
                             target_is_group,
                             msg,
+                            target_name,
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -2026,23 +2073,52 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         if let Some(sid) = msg.sticker_id.filter(|v| *v > 0) {
                                             let _ = gui_tx_clone.send(GuiEvent::StickerSent {
                                                 client_message_id: client_id.to_string(),
-                                                thread_id: target_id,
+                                                thread_id: target_id.clone(),
                                                 msg_id,
                                                 sticker_id: sid,
                                                 cate_id: msg.sticker_cate_id.unwrap_or(0),
                                                 sticker_type: msg.sticker_type.unwrap_or(7),
                                             });
+                                        } else if msg.link_url.is_some() {
+                                            let clean_text = if let Some(stripped) = msg.text.strip_prefix("[Đã thu hồi] ") {
+                                                stripped
+                                            } else {
+                                                &msg.text
+                                            };
+                                            let out_msg = ChatMessage {
+                                                id: if msg_id.is_empty() { format!("out_{client_id}") } else { msg_id },
+                                                client_message_id: client_id.to_string(),
+                                                sender: "Tôi".into(),
+                                                text: clean_text.to_string(),
+                                                time: crate::ui::clock(),
+                                                is_outgoing: true,
+                                                ts: (crate::login::unix_now() * 1000) as i64,
+                                                link_url: msg.link_url.clone(),
+                                                link_thumb: msg.link_thumb.clone(),
+                                                link_src: msg.link_src.clone(),
+                                                ..Default::default()
+                                            };
+                                            let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
+                                                thread_id: target_id.clone(),
+                                                msg: out_msg,
+                                            });
                                         } else {
+                                            let clean_text = if let Some(stripped) = msg.text.strip_prefix("[Đã thu hồi] ") {
+                                                stripped
+                                            } else {
+                                                &msg.text
+                                            };
                                             let _ = gui_tx_clone.send(GuiEvent::MessageSent {
                                                 client_message_id: client_id.to_string(),
-                                                thread_id: target_id,
-                                                text: msg.text.clone(),
+                                                thread_id: target_id.clone(),
+                                                text: clean_text.to_string(),
                                                 msg_id,
                                             });
                                         }
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
-                                            "Đã chuyển tiếp tin nhắn".into(),
-                                        ));
+                                        let _ = gui_tx_clone.send(GuiEvent::ForwardFinished {
+                                            target_name: target_name.clone(),
+                                            error: None,
+                                        });
                                     }
                                     Ok(resp) => {
                                         let err_s = format!(
@@ -2050,15 +2126,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             resp_error_code(&resp).unwrap_or(0)
                                         );
                                         crate::logger::log_error("gui::forward", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Chuyển tiếp thất bại: {err_s}"
-                                        )));
+                                        let _ = gui_tx_clone.send(GuiEvent::ForwardFinished {
+                                            target_name,
+                                            error: Some(err_s),
+                                        });
                                     }
                                     Err(e) => {
-                                        crate::logger::log_error("gui::forward", &e.to_string());
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Chuyển tiếp thất bại: {e}"
-                                        )));
+                                        let err_s = e.to_string();
+                                        crate::logger::log_error("gui::forward", &err_s);
+                                        let _ = gui_tx_clone.send(GuiEvent::ForwardFinished {
+                                            target_name,
+                                            error: Some(err_s),
+                                        });
                                     }
                                 }
                                 ctx_clone.request_repaint();
@@ -2397,11 +2476,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     } else if !url.starts_with("http://")
                                         && !url.starts_with("https://")
                                     {
-                                        (std::fs::read(&url).ok(), false)
+                                        let file_path = url.strip_prefix("local://").unwrap_or(&url);
+                                        (std::fs::read(file_path).ok(), false)
                                     } else {
                                         let client = { session_clone.lock().await.clone().http };
                                         let fetch_url = crate::store::jxl_to_jpg_url(&url);
-                                        let body = match client.get(&fetch_url).send().await {
+                                        let body = match client
+                                            .get(&fetch_url)
+                                            .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+                                            .send()
+                                            .await
+                                        {
                                             Ok(resp) if resp.status().is_success() => {
                                                 resp.bytes().await.ok()
                                             }
@@ -2410,6 +2495,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         (body.map(|b| b.to_vec()), true)
                                     };
                                 let Some(bytes) = bytes_opt else {
+                                    let _ = gui_tx_clone.send(GuiEvent::StickerImageFailed { key });
+                                    ctx_clone.request_repaint();
                                     return;
                                 };
 
@@ -2419,6 +2506,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             // Corrupt cache entry: drop it so the next request refetches.
                                             let _ = std::fs::remove_file(&cache_path);
                                         }
+                                        let _ = gui_tx_clone.send(GuiEvent::StickerImageFailed { key });
+                                        ctx_clone.request_repaint();
                                         return;
                                     };
                                     if from_network {
@@ -2629,6 +2718,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             images_only,
                             caption,
                             preset_path,
+                            original_hd,
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -2659,8 +2749,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ctx_clone.request_repaint();
 
                                 let s = session_clone.lock().await.clone();
-                                match crate::chat::send_attachment(
-                                    &s, &to_id, is_group, &path, &caption,
+                                match crate::chat::send_attachment_ext(
+                                    &s, &to_id, is_group, &path, &caption, original_hd,
                                 )
                                 .await
                                 {
@@ -2681,6 +2771,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     }
                                 }
                                 ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::TriggerScreenshot => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                capture_screen_interactive(gui_tx_clone, ctx_clone);
                             });
                         }
                         WorkerCmd::StartCall {
@@ -2965,6 +3062,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             ) {
                                                                 ex.avatar = gt.avatar;
                                                             }
+                                                            ex.presentation.posting_restricted = gt.presentation.posting_restricted;
                                                             ex.is_group = true;
                                                         } else {
                                                             list.push(gt);
@@ -3105,6 +3203,96 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ctx_clone.request_repaint();
                             });
                         }
+                        WorkerCmd::FetchGroupMembers { group_id } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                if let Ok((info_map, _)) = crate::chat::fetch_group_profiles(&s, &[group_id.clone()]).await {
+                                    if let Some(info) = info_map.get(&group_id) {
+                                        let mut member_uids: Vec<String> = Vec::new();
+                                        if let Some(arr) = info.get("memVerList").and_then(serde_json::Value::as_array) {
+                                            for item in arr {
+                                                if let Some(s_val) = item.as_str() {
+                                                    let uid = s_val.split('_').next().unwrap_or("").trim();
+                                                    if !uid.is_empty() && !member_uids.contains(&uid.to_string()) {
+                                                        member_uids.push(uid.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let creator_id = crate::chat::pick_str(info, &["creatorId"]).unwrap_or_default();
+                                        if !creator_id.is_empty() && !member_uids.contains(&creator_id) {
+                                            member_uids.insert(0, creator_id.clone());
+                                        }
+                                        let mut admin_ids: Vec<String> = Vec::new();
+                                        if let Some(admins) = info.get("adminIds").and_then(serde_json::Value::as_array) {
+                                            for a in admins {
+                                                if let Some(aid) = a.as_str() {
+                                                    let aid_s = aid.to_string();
+                                                    if !member_uids.contains(&aid_s) {
+                                                        member_uids.push(aid_s.clone());
+                                                    }
+                                                    if !admin_ids.contains(&aid_s) {
+                                                        admin_ids.push(aid_s);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let mut profiles = serde_json::Map::new();
+                                        for chunk in member_uids.chunks(50) {
+                                            if let Ok(mp) = crate::chat::get_mini_profiles(&s, chunk).await {
+                                                for (k, v) in mp {
+                                                    profiles.insert(k, v);
+                                                }
+                                            }
+                                        }
+                                        let mut members = Vec::new();
+                                        for uid in &member_uids {
+                                            let mut m_name = "Thành viên".to_string();
+                                            let mut m_ava = None;
+                                            if let Some(p) = profiles.get(uid) {
+                                                if let Some(n) = crate::chat::pick_str(p, &["displayName", "zaloName", "name"]) {
+                                                    if !n.is_empty() {
+                                                        m_name = n;
+                                                    }
+                                                }
+                                                if let Some(a) = crate::chat::pick_str(p, &["avatar", "avt"]) {
+                                                    if !a.is_empty() && !a.ends_with("/default") {
+                                                        m_ava = Some(a);
+                                                    }
+                                                }
+                                            }
+                                            let role = if uid == &creator_id {
+                                                "creator".to_string()
+                                            } else if admin_ids.contains(uid) {
+                                                "admin".to_string()
+                                            } else {
+                                                "member".to_string()
+                                            };
+                                            members.push(crate::chat::SidebarMember {
+                                                id: uid.clone(),
+                                                name: m_name,
+                                                avatar: m_ava,
+                                                role,
+                                            });
+                                        }
+                                        let _ = gui_tx_clone.send(GuiEvent::GroupMembersLoaded {
+                                            group_id,
+                                            members,
+                                        });
+                                        ctx_clone.request_repaint();
+                                        return;
+                                    }
+                                }
+                                let _ = gui_tx_clone.send(GuiEvent::GroupMembersLoaded {
+                                    group_id,
+                                    members: Vec::new(),
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
                         WorkerCmd::FetchMySocialAvatars { page, count } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -3143,6 +3331,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             use std::sync::atomic::Ordering;
                             if crate::history_sync::PHONE_SYNC_RUNNING.swap(true, Ordering::SeqCst)
                             {
+                                let _ = gui_tx.send(GuiEvent::StatusUpdate(
+                                    "⚠️ Tiến trình đồng bộ tin nhắn đang chạy ngầm, vui lòng chờ trong giây lát…".into(),
+                                ));
+                                egui_ctx.request_repaint();
                                 continue;
                             }
                             crate::history_sync::PHONE_SYNC_CANCEL.store(false, Ordering::Relaxed);
@@ -3570,4 +3762,85 @@ async fn download_attachment_with_original_name(
     })
     .await
     .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
+}
+
+pub(crate) fn capture_screen_interactive(
+    gui_tx: crate::gui::GuiTx,
+    ctx: egui::Context,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Start-Process ms-screenclip:"])
+            .status();
+        let _ = gui_tx.send(crate::gui::GuiEvent::StatusUpdate(
+            "Đã mở công cụ chụp ảnh màn hình — sau khi chụp hãy nhấn Ctrl+V để dán".into(),
+        ));
+        ctx.request_repaint();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let now = crate::login::unix_now();
+        let temp_path = std::env::temp_dir().join(format!("ctdozlite_screenshot_{now}.png"));
+
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("/usr/sbin/screencapture")
+            .args(["-i", "-x", temp_path.to_str().unwrap_or("")])
+            .status();
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let status = {
+            let temp_str = temp_path.to_str().unwrap_or("");
+            std::process::Command::new("flameshot")
+                .args(["gui", "-r", "-p", temp_str])
+                .status()
+                .or_else(|_| {
+                    std::process::Command::new("gnome-screenshot")
+                        .args(["-a", "-f", temp_str])
+                        .status()
+                })
+                .or_else(|_| {
+                    std::process::Command::new("spectacle")
+                        .args(["-b", "-r", "-o", temp_str])
+                        .status()
+                })
+                .or_else(|_| {
+                    std::process::Command::new("scrot")
+                        .args(["-s", temp_str])
+                        .status()
+                })
+        };
+
+        if let Ok(st) = status {
+            if st.success() && temp_path.exists() {
+                if let Ok(meta) = std::fs::metadata(&temp_path) {
+                    if meta.len() > 0 {
+                        if let Ok(bytes) = std::fs::read(&temp_path) {
+                            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                                if let Some((final_path, w, h, col_img)) =
+                                    crate::gui::messages::finalize_clipboard_rgba_image(
+                                        dyn_img.to_rgba8(),
+                                    )
+                                {
+                                    let _ = std::fs::remove_file(&temp_path);
+                                    let _ = gui_tx.send(crate::gui::GuiEvent::ScreenshotCaptured {
+                                        path: final_path,
+                                        width: w,
+                                        height: h,
+                                        image: col_img,
+                                    });
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = gui_tx.send(crate::gui::GuiEvent::StatusUpdate("Đã huỷ chụp màn hình".into()));
+        ctx.request_repaint();
+    }
 }

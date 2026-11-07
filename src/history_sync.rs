@@ -220,7 +220,10 @@ where
             0.10,
             "📲 Đang gửi yêu cầu đồng bộ tới Zalo trên điện thoại (hãy mở Zalo trên điện thoại và bấm 'Đồng bộ ngay')…".to_string(),
         );
-        let _ = chat::request_phone_sync(s, &pub_key).await;
+        let r1 = chat::request_phone_sync(s, &pub_key).await;
+        if let Ok(ref val) = r1 {
+            chat::merge_previews(threads, val);
+        }
         let _ = chat::request_phone_sync_v2(s, &pub_key).await;
 
         // Wait for user to confirm on phone (up to 90 seconds)
@@ -269,6 +272,22 @@ where
             }
         }
     }
+
+    // Phase 1b: Synchronize pinned conversations from server (/api/pinconvers/list, #87)
+    on_progress(
+        0.18,
+        "📌 Đang đồng bộ danh sách hội thoại đã ghim từ máy chủ Zalo…".to_string(),
+    );
+    if let Ok(pinned_val) = chat::get_pinned(s).await {
+        let pinned_ids = chat::parse_pinned_conversations(&pinned_val);
+        chat::apply_pinned_threads(threads, &pinned_ids);
+    }
+
+    if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+        let _ = chat::cancel_phone_sync(s, &pub_key).await;
+        return Ok((0, 0));
+    }
+
     // Phase 2: Drain `lp_chat` multi-batch action queues (`getChatFromPolling`)
     on_progress(
         0.22,

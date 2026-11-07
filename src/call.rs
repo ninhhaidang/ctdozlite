@@ -990,12 +990,17 @@ pub fn extract_voip_controls(data_node: &Value) -> Vec<Value> {
     voip_events
 }
 
-/// Poll `lp_control` (`getControllFromPolling`, cmd `99101`) once and return both incoming VoIP
-/// control events and real-time conversation mute/unmute events (#67).
+/// Poll `lp_control` (`getControllFromPolling`, cmd `99101`) once and return incoming VoIP
+/// control events, real-time conversation mute/unmute events, typing indicators, and seen events.
 pub async fn poll_control_events(
     s: &Session,
     state: &mut CtrlPollState,
-) -> Result<(Vec<Value>, Vec<crate::chat::MuteControlEvent>)> {
+) -> Result<(
+    Vec<Value>,
+    Vec<crate::chat::MuteControlEvent>,
+    Vec<crate::chat::TypingEvent>,
+    Vec<crate::chat::SeenEvent>,
+)> {
     if s.login.is_none() {
         bail!("chưa đăng nhập");
     }
@@ -1021,6 +1026,7 @@ pub async fn poll_control_events(
     state.update_from_response(data_node);
     crate::chat::dispatch_file_done_controls(data_node);
     let mute_events = crate::chat::extract_mute_controls(data_node, ts);
+    let (typing_events, seen_events) = crate::chat::extract_typing_and_seen_controls(data_node);
     if is_initial_cursor {
         // First poll with cursor "1" syncs `lastActionId`, but preserve any fresh (< 45s) incoming
         // `request` / `group_request` invite so a call ringing right as the app opens is not dropped.
@@ -1048,7 +1054,7 @@ pub async fn poll_control_events(
                 ev_ms > 0 && now_ms.saturating_sub(ev_ms) <= 45_000
             })
             .collect();
-        return Ok((fresh_invites, mute_events));
+        return Ok((fresh_invites, mute_events, typing_events, seen_events));
     }
     let events = extract_voip_controls(data_node);
     if !events.is_empty() {
@@ -1062,12 +1068,12 @@ pub async fn poll_control_events(
             ),
         );
     }
-    Ok((events, mute_events))
+    Ok((events, mute_events, typing_events, seen_events))
 }
 
 /// Poll `lp_control` (`getControllFromPolling`, cmd `99101`) once and return any incoming VoIP control events.
 pub async fn poll_voip_controls(s: &Session, state: &mut CtrlPollState) -> Result<Vec<Value>> {
-    let (voip, _) = poll_control_events(s, state).await?;
+    let (voip, _, _, _) = poll_control_events(s, state).await?;
     Ok(voip)
 }
 
@@ -3235,7 +3241,7 @@ impl CallBridge {
                                 if !matches_leg {
                                     continue;
                                 }
-                                if !st.is_connected {
+                                if st.is_caller && !st.is_connected {
                                     let _ =
                                         gui_tx.send(GuiEvent::CallStateChanged("ringing".into()));
                                     let _ = gui_tx.send(GuiEvent::StatusUpdate(
@@ -3386,6 +3392,58 @@ impl CallBridge {
                                 } else {
                                     status
                                 };
+
+                                if !st_check.is_caller {
+                                    // Callee receiving an answer event before accepting locally:
+                                    // 1) Group call: if from another member, record them in active list and keep ringing.
+                                    if st_check.is_group {
+                                        let fid = data
+                                            .get("fromId")
+                                            .and_then(|v| {
+                                                v.as_u64().or_else(|| {
+                                                    v.as_str().and_then(|s| s.parse().ok())
+                                                })
+                                            })
+                                            .map(|v| v as u32)
+                                            .unwrap_or(0);
+                                        if fid != 0 && fid != st_check.from_uid_u32 {
+                                            if let Some(st) = guard.as_mut() {
+                                                st.group_pending_uids.retain(|&u| u != fid);
+                                                if eff_status == 0
+                                                    && !st.group_active_uids.contains(&fid)
+                                                {
+                                                    st.group_active_uids.push(fid);
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
+
+                                    // 2) Native Zalo callee benign status=5 packet ~0–1s into incoming call.
+                                    if status == 5 {
+                                        continue;
+                                    }
+
+                                    // 3) Call was answered on another device (e.g. mobile phone, eff_status == 0)
+                                    //    or rejected/ended on another device (eff_status != 0).
+                                    // Dismiss ringing on this desktop client and clean up active call resources.
+                                    let is_group = st_check.is_group;
+                                    let _taken = guard.take();
+                                    let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
+                                    let msg = if eff_status == 0 {
+                                        if is_group {
+                                            "Cuộc gọi nhóm đã được trả lời trên thiết bị khác"
+                                        } else {
+                                            "Cuộc gọi đã được trả lời trên thiết bị khác"
+                                        }
+                                    } else {
+                                        "Cuộc gọi đã kết thúc từ thiết bị khác"
+                                    };
+                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(msg.into()));
+                                    egui_ctx.request_repaint();
+                                    continue;
+                                }
+
                                 if eff_status == 0 {
                                     if let Some(st) = guard.as_mut() {
                                         // If an extra leg answered first before primary connected, promote it to primary!
@@ -3587,10 +3645,7 @@ impl CallBridge {
                                     let _ = gui_tx.send(GuiEvent::StatusUpdate(
                                         "🟢 Người nhận đã bắt máy — Đang trong cuộc gọi".into(),
                                     ));
-                                } else if !st_check.is_caller && status == 5 {
-                                    continue;
-                                } else if st_check.is_caller
-                                    && status == 5
+                                } else if status == 5
                                     && st_check.started_at.elapsed()
                                         < std::time::Duration::from_secs(8)
                                     && !event_media_params(&data)
@@ -3702,7 +3757,7 @@ impl CallBridge {
                                         }
                                     }
                                 }
-                                if call_state == 3 && !st.is_connected {
+                                if call_state == 3 && st.is_caller && !st.is_connected {
                                     st.is_connected = true;
                                     st.started_at = std::time::Instant::now();
                                     let _ =
@@ -4716,5 +4771,146 @@ mod tests {
             u32::from_le_bytes(end[21..25].try_into().unwrap()),
             845699558
         );
+    }
+
+    #[tokio::test]
+    async fn callee_dismisses_ringing_when_answered_on_another_device() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let egui_ctx = eframe::egui::Context::default();
+        let gui_tx = crate::gui::GuiTx::new(tx, egui_ctx.clone());
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let bridge = CallBridge::spawn(session, gui_tx, egui_ctx);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // 1. Incoming call arrives
+        bridge.handle_control_event(json!({
+            "act": "request",
+            "data": {
+                "callId": 998877,
+                "uidN": "1000000000000000002",
+                "uidFrom": "1000000000000000002",
+                "ts": now_ms,
+                "Dname": "Test Caller"
+            }
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drain events to confirm IncomingCall
+        let mut got_incoming = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let GuiEvent::IncomingCall { call_id, .. } = ev {
+                if call_id == 998877 {
+                    got_incoming = true;
+                }
+            }
+        }
+        assert!(got_incoming, "IncomingCall event should be dispatched");
+
+        // 2. Answer arrives from another device (eff_status == 0)
+        bridge.handle_control_event(json!({
+            "act": "answer",
+            "data": {
+                "callId": 998877,
+                "status": 0,
+                "uidFrom": "1000000000000000002"
+            }
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut got_free = false;
+        let mut got_connected = false;
+        let mut status_msg = String::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                GuiEvent::CallStateChanged(state) => {
+                    if state == "free" {
+                        got_free = true;
+                    }
+                    if state == "connected" {
+                        got_connected = true;
+                    }
+                }
+                GuiEvent::StatusUpdate(msg) => {
+                    status_msg = msg;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(got_free, "Call state must transition to 'free'");
+        assert!(!got_connected, "Callee must NEVER transition to 'connected' when answered on another device");
+        assert!(status_msg.contains("thiết bị khác"), "Status message should indicate answered on another device: {status_msg}");
+    }
+
+    #[tokio::test]
+    async fn callee_ignores_benign_status_5_while_ringing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let egui_ctx = eframe::egui::Context::default();
+        let gui_tx = crate::gui::GuiTx::new(tx, egui_ctx.clone());
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let bridge = CallBridge::spawn(session, gui_tx, egui_ctx);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        bridge.handle_control_event(json!({
+            "act": "request",
+            "data": {
+                "callId": 887766,
+                "uidN": "1000000000000000002",
+                "uidFrom": "1000000000000000002",
+                "ts": now_ms,
+                "Dname": "Test Caller"
+            }
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drain IncomingCall event
+        let mut got_incoming = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let GuiEvent::IncomingCall { call_id, .. } = ev {
+                if call_id == 887766 {
+                    got_incoming = true;
+                }
+            }
+        }
+        assert!(got_incoming);
+
+        // Native Zalo sends benign status=5 packet ~0-1s into ringing
+        bridge.handle_control_event(json!({
+            "act": "answer",
+            "data": {
+                "callId": 887766,
+                "status": 5,
+                "uidFrom": "1000000000000000002"
+            }
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut got_free = false;
+        let mut got_connected = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let GuiEvent::CallStateChanged(state) = ev {
+                if state == "free" {
+                    got_free = true;
+                }
+                if state == "connected" {
+                    got_connected = true;
+                }
+            }
+        }
+
+        assert!(!got_free, "Call must stay active and ringing, not free");
+        assert!(!got_connected, "Call must not connect on intermediate status 5");
     }
 }

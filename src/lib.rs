@@ -39,3 +39,6 @@ pub mod api_mcp;
 /// Native notification authorization without delivery.
 pub mod native_notifications;
 pub mod cskh;
+
+#[cfg(any(windows, test))]
+mod clipboard_dib;
